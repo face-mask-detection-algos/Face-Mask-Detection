@@ -9,11 +9,14 @@ import numpy as np
 import argparse
 import cv2
 import os
+
+
 def mask_image():
 	# construct the argument parser and parse the arguments
 	ap = argparse.ArgumentParser()
-	ap.add_argument("-i", "--image", required=True,
+	ap.add_argument("-i", "--image_folder", required=True,
 		help="path to input image")
+	ap.add_argument("-e", "--extension", default=".jpg", help="extension of images to be evaluated (default .jpg)")
 	ap.add_argument("-f", "--face", type=str,
 		default="face_detector",
 		help="path to face detector model directory")
@@ -22,6 +25,8 @@ def mask_image():
 		help="path to trained face mask detector model")
 	ap.add_argument("-c", "--confidence", type=float, default=0.5,
 		help="minimum probability to filter weak detections")
+	ap.add_argument("-o", "--output", type=str, default="output.txt", help="path to output file")
+	ap.add_argument("--scale_factor", type=float, default=None, help="rescale input")
 	args = vars(ap.parse_args())
 
 	# load our serialized face detector model from disk
@@ -35,70 +40,88 @@ def mask_image():
 	print("[INFO] loading face mask detector model...")
 	model = load_model(args["model"])
 
-	# load the input image from disk, clone it, and grab the image spatial
-	# dimensions
-	image = cv2.imread(args["image"])
-	orig = image.copy()
-	(h, w) = image.shape[:2]
+	images = [os.path.join(args["image_folder"], img) for img in os.listdir(args["image_folder"]) if img.endswith(args["extension"])]
 
-	# construct a blob from the image
-	blob = cv2.dnn.blobFromImage(image, 1.0, (300, 300),
-		(104.0, 177.0, 123.0))
+	for image_path in images:
+		# load the input image from disk, clone it, and grab the image spatial
+		# dimensionsi
+		image = cv2.imread(image_path)
+		if image is None:
+			print(f"Coudn't read image {image_path}")
+			continue
+		if args["scale_factor"] is not None and args["scale_factor"] != 1.0:
+			h, w = image.shape[:2]
+			new_h = int(h * args["scale_factor"])
+			new_w = int(w * args["scale_factor"])
+			image = cv2.resize(image, (new_w, new_h))
+		# orig = image.copy()
+		(h, w) = image.shape[:2]
 
-	# pass the blob through the network and obtain the face detections
-	print("[INFO] computing face detections...")
-	net.setInput(blob)
-	detections = net.forward()
+		# construct a blob from the image
+		blob = cv2.dnn.blobFromImage(image, 1.0, (300, 300),
+			(104.0, 177.0, 123.0))
 
-	# loop over the detections
-	for i in range(0, detections.shape[2]):
-		# extract the confidence (i.e., probability) associated with
-		# the detection
-		confidence = detections[0, 0, i, 2]
+		# pass the blob through the network and obtain the face detections
+		print("[INFO] computing face detections...")
+		net.setInput(blob)
+		detections = net.forward()
 
-		# filter out weak detections by ensuring the confidence is
-		# greater than the minimum confidence
-		if confidence > args["confidence"]:
-			# compute the (x, y)-coordinates of the bounding box for
-			# the object
-			box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
-			(startX, startY, endX, endY) = box.astype("int")
+		# loop over the detections
+		for i in range(0, detections.shape[2]):
+			# extract the confidence (i.e., probability) associated with
+			# the detection
+			confidence = detections[0, 0, i, 2]
 
-			# ensure the bounding boxes fall within the dimensions of
-			# the frame
-			(startX, startY) = (max(0, startX), max(0, startY))
-			(endX, endY) = (min(w - 1, endX), min(h - 1, endY))
+			# filter out weak detections by ensuring the confidence is
+			# greater than the minimum confidence
+			if confidence > args["confidence"]:
+				# compute the (x, y)-coordinates of the bounding box for
+				# the object
+				box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+				(startX, startY, endX, endY) = box.astype("int")
+				if startX > w or startY > h or endX < 0 or endY < 0:
+					print(f"{image_path}: Invalid box ({startX}, {startY}, {endX}, {endY}) outside margins ({w}, {h})")
+					continue
 
-			# extract the face ROI, convert it from BGR to RGB channel
-			# ordering, resize it to 224x224, and preprocess it
-			face = image[startY:endY, startX:endX]
-			face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
-			face = cv2.resize(face, (224, 224))
-			face = img_to_array(face)
-			face = preprocess_input(face)
-			face = np.expand_dims(face, axis=0)
+				# ensure the bounding boxes fall within the dimensions of
+				# the frame
+				(startX, startY) = (max(0, startX), max(0, startY))
+				(endX, endY) = (min(w - 1, endX), min(h - 1, endY))
 
-			# pass the face through the model to determine if the face
-			# has a mask or not
-			(mask, withoutMask) = model.predict(face)[0]
+				# extract the face ROI, convert it from BGR to RGB channel
+				# ordering, resize it to 224x224, and preprocess it
+				face = image[startY:endY, startX:endX]
+				face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
+				face = cv2.resize(face, (224, 224))
+				face = img_to_array(face)
+				face = preprocess_input(face)
+				face = np.expand_dims(face, axis=0)
 
-			# determine the class label and color we'll use to draw
-			# the bounding box and text
-			label = "Mask" if mask > withoutMask else "No Mask"
-			color = (0, 255, 0) if label == "Mask" else (0, 0, 255)
+				# pass the face through the model to determine if the face
+				# has a mask or not
+				(mask, withoutMask) = model.predict(face)[0]
 
-			# include the probability in the label
-			label = "{}: {:.2f}%".format(label, max(mask, withoutMask) * 100)
+				# determine the class label and color we'll use to draw
+				# the bounding box and text
+				label = "Mask" if mask > withoutMask else "No Mask"
 
-			# display the label and bounding box rectangle on the output
-			# frame
-			cv2.putText(image, label, (startX, startY - 10),
-				cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
-			cv2.rectangle(image, (startX, startY), (endX, endY), color, 2)
+				with open(args["output"], "a") as f:
+					f.write(f"{image_path},{label},{confidence},{startX/w},{startY/h},{(endX-startX)/w},{(endY-startY)/h}\n")
 
-	# show the output image
-	cv2.imshow("Output", image)
-	cv2.waitKey(0)
+				# color = (0, 255, 0) if label == "Mask" else (0, 0, 255)
+
+				# # include the probability in the label
+				# label = "{}: {:.2f}%".format(label, max(mask, withoutMask) * 100)
+
+				# # display the label and bounding box rectangle on the output
+				# # frame
+				# cv2.putText(image, label, (startX, startY - 10),
+				# 	cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
+				# cv2.rectangle(image, (startX, startY), (endX, endY), color, 2)
+
+		# show the output image
+		# cv2.imshow("Output", image)
+		# cv2.waitKey(0)
 	
 if __name__ == "__main__":
 	mask_image()
